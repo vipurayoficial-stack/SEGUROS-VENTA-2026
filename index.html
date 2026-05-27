@@ -2067,6 +2067,21 @@
         return payload;
       };
 
+      const toPaymentUpdatePayload = (soap) => {
+        const pagado = Number(soap.pagado) || 0;
+        const adeudado = Number(soap.adeudado) || 0;
+        const metodoPago = soap.metodoPago || '';
+        const estado = soap.estado || normalizeEstado('', pagado, adeudado);
+        return {
+          efectivo: metodoPago === 'efectivo' ? pagado : 0,
+          transferencia: metodoPago === 'transferencia' ? pagado : 0,
+          total_recibido: pagado,
+          adeudado,
+          estado_pago: estadoToSupabase(estado),
+          updated_at: new Date().toISOString()
+        };
+      };
+
       const fetchSoaps = async ({ seedIfEmpty = true } = {}) => {
         if (!sb?.client) return;
 
@@ -2199,7 +2214,12 @@
 
       const showNotification = (msg) => {
         setNotification(msg);
-        setTimeout(() => setNotification(null), 4000);
+        setTimeout(() => setNotification(null), 9000);
+      };
+
+      const getSupabaseErrorMessage = (error) => {
+        const parts = [error?.message, error?.details, error?.hint, error?.code].filter(Boolean);
+        return parts.length ? parts.join(' | ') : 'Error desconocido de Supabase.';
       };
 
       const closePaymentModal = () => {
@@ -2281,7 +2301,7 @@
           const { error } = await withTimeout(
             sb.client
               .from(sb.table)
-              .update(toDbPayload(updatedSoap, { includeId: false }))
+              .update(toPaymentUpdatePayload(updatedSoap))
               .eq('id', updatedSoap.id)
           );
           if (error) throw error;
@@ -2292,7 +2312,7 @@
           if (isOperationTimeout(error)) {
             showNotification('No pudimos confirmar el guardado. Revisa tu conexión e intenta otra vez.');
           } else {
-            showNotification('Error al guardar. Revisa Supabase y RLS.');
+            showNotification(`Error Supabase: ${getSupabaseErrorMessage(error)}`);
             setEditingSoap(editingSoap);
           }
         } finally {
@@ -2327,7 +2347,7 @@
           if (isOperationTimeout(error)) {
             showNotification('No pudimos confirmar el guardado. Revisa tu conexión e intenta otra vez.');
           } else {
-            showNotification('Error al guardar. Revisa Supabase y RLS.');
+            showNotification(`Error Supabase: ${getSupabaseErrorMessage(error)}`);
             setIsAdding(true);
           }
         } finally {
@@ -2438,7 +2458,11 @@
             const updatedSoap = { ...soap, estado: 'pendiente', pagado: Number(soap.pagado) || 0 };
             const { error } = await sb.client
               .from(sb.table)
-              .update(toDbPayload(updatedSoap, { includeId: false }))
+              .update({
+                adeudado: Number(updatedSoap.adeudado) || 0,
+                estado_pago: 'Adeudado',
+                updated_at: new Date().toISOString()
+              })
               .eq('id', soap.id);
             if (error) throw error;
           });
@@ -2456,7 +2480,7 @@
            if (isOperationTimeout(error)) {
              showNotification("No pudimos confirmar el guardado. Revisa tu conexión e intenta otra vez.");
            } else {
-             showNotification("Error al guardar los SOAPs importados en Supabase.");
+             showNotification(`Error Supabase: ${getSupabaseErrorMessage(error)}`);
              setPdfResultModal(pdfResultModal);
            }
         } finally {
