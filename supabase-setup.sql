@@ -78,35 +78,77 @@ execute function public.set_updated_at();
 
 alter table public.ventas_soap enable row level security;
 
+create table if not exists public.app_allowed_users (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  role text not null check (role in ('admin', 'editor', 'viewer')),
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+alter table public.app_allowed_users enable row level security;
+
+create or replace function public.current_app_role()
+returns text
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select role
+  from public.app_allowed_users
+  where user_id = auth.uid()
+    and active = true
+  limit 1
+$$;
+
+revoke all on function public.current_app_role() from public;
+grant execute on function public.current_app_role() to authenticated;
+
 drop policy if exists "ventas_soap_select_authenticated" on public.ventas_soap;
 drop policy if exists "ventas_soap_insert_authenticated" on public.ventas_soap;
 drop policy if exists "ventas_soap_update_authenticated" on public.ventas_soap;
 drop policy if exists "ventas_soap_delete_authenticated" on public.ventas_soap;
+drop policy if exists "ventas_soap_select_allowed_users" on public.ventas_soap;
+drop policy if exists "ventas_soap_insert_editors" on public.ventas_soap;
+drop policy if exists "ventas_soap_update_editors" on public.ventas_soap;
+drop policy if exists "app_allowed_users_self_or_admin_select" on public.app_allowed_users;
 
-create policy "ventas_soap_select_authenticated"
+create policy "ventas_soap_select_allowed_users"
 on public.ventas_soap
 for select
 to authenticated
-using (true);
+using (public.current_app_role() in ('admin', 'editor', 'viewer'));
 
-create policy "ventas_soap_insert_authenticated"
+create policy "ventas_soap_insert_editors"
 on public.ventas_soap
 for insert
 to authenticated
-with check (true);
+with check (public.current_app_role() in ('admin', 'editor'));
 
-create policy "ventas_soap_update_authenticated"
+create policy "ventas_soap_update_editors"
 on public.ventas_soap
 for update
 to authenticated
-using (true)
-with check (true);
+using (public.current_app_role() in ('admin', 'editor'))
+with check (public.current_app_role() in ('admin', 'editor'));
 
-create policy "ventas_soap_delete_authenticated"
-on public.ventas_soap
-for delete
+create policy "app_allowed_users_self_or_admin_select"
+on public.app_allowed_users
+for select
 to authenticated
-using (true);
+using (
+  user_id = auth.uid()
+  or public.current_app_role() = 'admin'
+);
+
+revoke delete on public.ventas_soap from anon, authenticated;
+grant select, insert, update on public.ventas_soap to authenticated;
+grant select on public.app_allowed_users to authenticated;
+
+-- Despues de crear tu usuario en Supabase Auth, agrega su UUID a la lista blanca:
+-- insert into public.app_allowed_users (user_id, role)
+-- values ('TU_AUTH_USER_ID_AQUI', 'admin')
+-- on conflict (user_id) do update set role = excluded.role, active = true;
 
 do $$
 begin
