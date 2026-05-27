@@ -117,20 +117,32 @@ create policy "ventas_soap_select_allowed_users"
 on public.ventas_soap
 for select
 to authenticated
-using (public.current_app_role() in ('admin', 'editor', 'viewer'));
+using (
+  public.current_app_role() in ('admin', 'editor', 'viewer')
+  and auth.jwt() ->> 'aal' = 'aal2'
+);
 
 create policy "ventas_soap_insert_editors"
 on public.ventas_soap
 for insert
 to authenticated
-with check (public.current_app_role() in ('admin', 'editor'));
+with check (
+  public.current_app_role() in ('admin', 'editor')
+  and auth.jwt() ->> 'aal' = 'aal2'
+);
 
 create policy "ventas_soap_update_editors"
 on public.ventas_soap
 for update
 to authenticated
-using (public.current_app_role() in ('admin', 'editor'))
-with check (public.current_app_role() in ('admin', 'editor'));
+using (
+  public.current_app_role() in ('admin', 'editor')
+  and auth.jwt() ->> 'aal' = 'aal2'
+)
+with check (
+  public.current_app_role() in ('admin', 'editor')
+  and auth.jwt() ->> 'aal' = 'aal2'
+);
 
 create policy "app_allowed_users_self_or_admin_select"
 on public.app_allowed_users

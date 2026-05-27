@@ -53,4 +53,3 @@ Root directory: /
 ## 4. Primer inicio
 
 Al entrar con un usuario valido y autorizado en `app_allowed_users`, la app leera los datos desde Supabase. Los cambios hechos en un dispositivo se guardan en Supabase y se escuchan por Realtime.
-Deploy refresh

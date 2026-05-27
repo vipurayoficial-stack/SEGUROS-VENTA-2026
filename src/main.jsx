@@ -58,9 +58,19 @@ function App() {
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isMfaChecking, setIsMfaChecking] = useState(false);
+  const [mfaRequired, setMfaRequired] = useState(false);
+  const [mfaMode, setMfaMode] = useState('');
+  const [mfaFactorId, setMfaFactorId] = useState('');
+  const [mfaChallengeId, setMfaChallengeId] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaQrCode, setMfaQrCode] = useState('');
+  const [mfaSecret, setMfaSecret] = useState('');
+  const [isMfaVerifying, setIsMfaVerifying] = useState(false);
 
   // --- ESTADOS PARA LECTURA DE PDF ---
   const fileInputRef = useRef(null);
+  const mfaPreparationRef = useRef(false);
   const [isProcessingPdf, setIsProcessingPdf] = useState(false);
   const [pdfResultModal, setPdfResultModal] = useState({ show: false, newSoaps: [], existingToUpdate: [], duplicates: 0 });
 
@@ -206,6 +216,83 @@ function App() {
     setSoaps(loadedSoaps);
   };
 
+  const resetMfaState = () => {
+    setMfaRequired(false);
+    setMfaMode('');
+    setMfaFactorId('');
+    setMfaChallengeId('');
+    setMfaCode('');
+    setMfaQrCode('');
+    setMfaSecret('');
+  };
+
+  const startMfaChallenge = async (factorId, mode) => {
+    const { data, error } = await sb.client.auth.mfa.challenge({ factorId });
+    if (error) throw error;
+    setMfaFactorId(factorId);
+    setMfaChallengeId(data.id);
+    setMfaCode('');
+    setMfaMode(mode);
+    setMfaRequired(true);
+  };
+
+  const prepareMfa = async (nextSession) => {
+    if (!nextSession || !sb?.client) {
+      resetMfaState();
+      return;
+    }
+
+    if (mfaPreparationRef.current) return;
+    mfaPreparationRef.current = true;
+    setIsMfaChecking(true);
+    try {
+      const { data: assurance, error: assuranceError } = await sb.client.auth.mfa.getAuthenticatorAssuranceLevel();
+      if (assuranceError) throw assuranceError;
+
+      if (assurance.currentLevel === 'aal2') {
+        resetMfaState();
+        return;
+      }
+
+      if (assurance.nextLevel !== 'aal2') {
+        const { data: enrollment, error: enrollError } = await sb.client.auth.mfa.enroll({
+          factorType: 'totp'
+        });
+        if (enrollError) throw enrollError;
+        setMfaQrCode(enrollment.totp?.qr_code || '');
+        setMfaSecret(enrollment.totp?.secret || '');
+        await startMfaChallenge(enrollment.id, 'enroll');
+        return;
+      }
+
+      const { data: factors, error: factorsError } = await sb.client.auth.mfa.listFactors();
+      if (factorsError) throw factorsError;
+
+      const verifiedTotp = factors.totp?.find((factor) => factor.status === 'verified');
+      if (verifiedTotp) {
+        setMfaQrCode('');
+        setMfaSecret('');
+        await startMfaChallenge(verifiedTotp.id, 'verify');
+        return;
+      }
+
+      const { data: enrollment, error: enrollError } = await sb.client.auth.mfa.enroll({
+        factorType: 'totp'
+      });
+      if (enrollError) throw enrollError;
+      setMfaQrCode(enrollment.totp?.qr_code || '');
+      setMfaSecret(enrollment.totp?.secret || '');
+      await startMfaChallenge(enrollment.id, 'enroll');
+    } catch (error) {
+      console.error('Error preparando MFA:', error);
+      setConnectionError('No se pudo preparar el segundo factor. Revisa la configuracion MFA en Supabase.');
+      resetMfaState();
+    } finally {
+      mfaPreparationRef.current = false;
+      setIsMfaChecking(false);
+    }
+  };
+
   // Autenticación con Supabase para que RLS proteja la tabla.
   useEffect(() => {
     if (!sb) return;
@@ -222,8 +309,10 @@ function App() {
         const { data, error } = await sb.client.auth.getSession();
         if (error) throw error;
         setSession(data.session);
+        await prepareMfa(data.session);
         const { data: listener } = sb.client.auth.onAuthStateChange((_event, nextSession) => {
           setSession(nextSession);
+          prepareMfa(nextSession);
         });
         authSubscription = listener.subscription;
       } catch (error) {
@@ -240,7 +329,7 @@ function App() {
 
   // Conexión a Supabase + escucha de cambios en tiempo real.
   useEffect(() => {
-    if (!session || !sb?.client) {
+    if (!session || mfaRequired || isMfaChecking || !sb?.client) {
       setIsLoading(false);
       return;
     }
@@ -274,7 +363,7 @@ function App() {
       isActive = false;
       sb.client.removeChannel(channel);
     };
-  }, [session, sb]);
+  }, [session, mfaRequired, isMfaChecking, sb]);
 
   // Cálculo de Métricas en vivo
   const metrics = useMemo(() => {
@@ -360,13 +449,14 @@ function App() {
     if (!sb?.client) return;
     setIsLoggingIn(true);
     try {
-      const { error } = await sb.client.auth.signInWithPassword({
+      const { data, error } = await sb.client.auth.signInWithPassword({
         email: loginEmail.trim(),
         password: loginPassword
       });
       if (error) throw error;
       setConnectionError('');
-      showNotification('Sesión iniciada.');
+      await prepareMfa(data.session);
+      showNotification('Credenciales correctas.');
     } catch (error) {
       console.error("Error iniciando sesión:", error);
       showNotification('No se pudo iniciar sesión. Revisa email y contraseña.');
@@ -379,7 +469,32 @@ function App() {
     if (!sb?.client) return;
     await sb.client.auth.signOut();
     setSoaps([]);
+    resetMfaState();
     showNotification('Sesión cerrada.');
+  };
+
+  const handleMfaVerify = async (e) => {
+    e.preventDefault();
+    if (!sb?.client || !mfaFactorId || !mfaChallengeId) return;
+    setIsMfaVerifying(true);
+    try {
+      const { error } = await sb.client.auth.mfa.verify({
+        factorId: mfaFactorId,
+        challengeId: mfaChallengeId,
+        code: mfaCode.trim()
+      });
+      if (error) throw error;
+      const { data: refreshed } = await sb.client.auth.getSession();
+      setSession(refreshed.session);
+      resetMfaState();
+      setConnectionError('');
+      showNotification('Segundo factor verificado. Sesión blindada.');
+    } catch (error) {
+      console.error('Error verificando MFA:', error);
+      showNotification('Codigo MFA invalido o vencido. Intenta con el codigo actual.');
+    } finally {
+      setIsMfaVerifying(false);
+    }
   };
 
   const handleSaveEdit = async (e) => {
@@ -636,7 +751,62 @@ function App() {
           </div>
         )}
 
-        {!session && !isAuthLoading ? (
+        {session && mfaRequired ? (
+          <div className="max-w-md mx-auto bg-white rounded-xl shadow-sm border border-slate-100 p-6">
+            <div className="mb-5">
+              <h2 className="text-2xl font-bold text-slate-900">
+                {mfaMode === 'enroll' ? 'Activar segundo factor' : 'Verificar segundo factor'}
+              </h2>
+              <p className="text-sm text-slate-500 mt-1">
+                {mfaMode === 'enroll'
+                  ? 'Escanea el QR con Google Authenticator, Authy, 1Password o iCloud Passwords.'
+                  : 'Ingresa el codigo de 6 digitos de tu app autenticadora.'}
+              </p>
+            </div>
+
+            {mfaMode === 'enroll' && (
+              <div className="space-y-4 mb-5">
+                {mfaQrCode && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex justify-center">
+                    <img src={mfaQrCode} alt="Codigo QR para activar MFA" className="w-52 h-52" />
+                  </div>
+                )}
+                {mfaSecret && (
+                  <div className="rounded-lg bg-slate-100 px-4 py-3 text-sm text-slate-700">
+                    <p className="font-bold mb-1">Clave manual</p>
+                    <p className="font-mono break-all">{mfaSecret}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <form onSubmit={handleMfaVerify} className="space-y-4">
+              <div>
+                <label className="block text-sm font-bold text-slate-700 mb-1">Codigo MFA</label>
+                <input
+                  type="text"
+                  required
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxLength="6"
+                  value={mfaCode}
+                  onChange={e => setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  className="w-full px-4 py-3 border border-slate-300 rounded-lg text-center text-2xl font-mono tracking-[0.5em]"
+                  placeholder="000000"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={isMfaVerifying || mfaCode.length !== 6}
+                className="w-full px-5 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-bold flex items-center justify-center gap-2 disabled:opacity-60"
+              >
+                {isMfaVerifying && <Loader2 className="w-4 h-4 animate-spin" />}
+                {isMfaVerifying ? 'Verificando...' : 'Verificar y entrar'}
+              </button>
+            </form>
+          </div>
+        ) : !session && !isAuthLoading ? (
           <div className="max-w-md mx-auto bg-white rounded-xl shadow-sm border border-slate-100 p-6">
             <div className="mb-5">
               <h2 className="text-2xl font-bold text-slate-900">Entrar al sistema</h2>
