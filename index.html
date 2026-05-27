@@ -2049,12 +2049,10 @@
           precio_cobrado: Number(soap.precioCobrado) || total || null,
           efectivo,
           transferencia,
-          estado_pago: estadoToSupabase(estado),
           vendedor: soap.vendedor || null,
           comprobante: soap.comprobante || null,
           observaciones: soap.observaciones || null,
-          revision: soap.revision || null,
-          updated_at: new Date().toISOString()
+          revision: soap.revision || null
         };
 
         if (options.includeId !== false) {
@@ -2067,14 +2065,10 @@
 
       const toPaymentUpdatePayload = (soap) => {
         const pagado = Number(soap.pagado) || 0;
-        const adeudado = Number(soap.adeudado) || 0;
         const metodoPago = soap.metodoPago || '';
-        const estado = soap.estado || normalizeEstado('', pagado, adeudado);
         return {
           efectivo: metodoPago === 'efectivo' ? pagado : 0,
-          transferencia: metodoPago === 'transferencia' ? pagado : 0,
-          estado_pago: estadoToSupabase(estado),
-          updated_at: new Date().toISOString()
+          transferencia: metodoPago === 'transferencia' ? pagado : 0
         };
       };
 
@@ -2456,9 +2450,7 @@
               .from(sb.table)
               .update({
                 prima: Number(updatedSoap.adeudado) || Number(updatedSoap.prima) || 0,
-                precio_cobrado: Number(updatedSoap.adeudado) || Number(updatedSoap.precioCobrado) || 0,
-                estado_pago: 'Adeudado',
-                updated_at: new Date().toISOString()
+                precio_cobrado: Number(updatedSoap.adeudado) || Number(updatedSoap.precioCobrado) || 0
               })
               .eq('id', soap.id);
             if (error) throw error;
