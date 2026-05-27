@@ -59,6 +59,8 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [isMfaChecking, setIsMfaChecking] = useState(false);
+  const [mfaVerified, setMfaVerified] = useState(false);
+  const [mfaError, setMfaError] = useState('');
   const [mfaRequired, setMfaRequired] = useState(false);
   const [mfaMode, setMfaMode] = useState('');
   const [mfaFactorId, setMfaFactorId] = useState('');
@@ -231,8 +233,49 @@ function App() {
     setMfaRequired(true);
   };
 
+  const createMfaFriendlyName = () => {
+    const suffix = window.crypto?.randomUUID
+      ? window.crypto.randomUUID().slice(0, 8)
+      : `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    return `Ventas SOAP ${suffix}`;
+  };
+
+  const cleanupUnverifiedTotpFactors = async (factors) => {
+    const unverifiedFactors = (factors?.all || []).filter((factor) => (
+      factor.factor_type === 'totp' && factor.status === 'unverified'
+    ));
+
+    for (const factor of unverifiedFactors) {
+      const { error } = await sb.client.auth.mfa.unenroll({ factorId: factor.id });
+      if (error) {
+        console.warn('No se pudo eliminar un factor MFA pendiente:', error);
+      }
+    }
+  };
+
+  const enrollTotpFactor = async () => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const { data, error } = await sb.client.auth.mfa.enroll({
+        factorType: 'totp',
+        friendlyName: createMfaFriendlyName()
+      });
+
+      if (!error) return data;
+
+      lastError = error;
+      if (error.code !== 'mfa_factor_name_conflict') break;
+    }
+
+    throw lastError;
+  };
+
   const prepareMfa = async (nextSession) => {
     if (!nextSession || !sb?.client) {
+      setMfaVerified(false);
+      setMfaError('');
+      setSoaps([]);
       resetMfaState();
       return;
     }
@@ -240,14 +283,19 @@ function App() {
     if (mfaPreparationRef.current) return;
     mfaPreparationRef.current = true;
     setIsMfaChecking(true);
+    setMfaError('');
     try {
       const { data: assurance, error: assuranceError } = await sb.client.auth.mfa.getAuthenticatorAssuranceLevel();
       if (assuranceError) throw assuranceError;
 
       if (assurance.currentLevel === 'aal2') {
+        setMfaVerified(true);
         resetMfaState();
         return;
       }
+
+      setMfaVerified(false);
+      setSoaps([]);
 
       const { data: factors, error: factorsError } = await sb.client.auth.mfa.listFactors();
       if (factorsError) throw factorsError;
@@ -260,21 +308,17 @@ function App() {
         return;
       }
 
-      const unverifiedTotp = factors.totp?.find((factor) => factor.status === 'unverified');
-      if (unverifiedTotp) {
-        await sb.client.auth.mfa.unenroll({ factorId: unverifiedTotp.id });
-      }
+      await cleanupUnverifiedTotpFactors(factors);
 
-      const { data: enrollment, error: enrollError } = await sb.client.auth.mfa.enroll({
-        factorType: 'totp'
-      });
-      if (enrollError) throw enrollError;
+      const enrollment = await enrollTotpFactor();
       setMfaQrCode(enrollment.totp?.qr_code || '');
       setMfaSecret(enrollment.totp?.secret || '');
       requireMfaCode(enrollment.id, 'enroll');
     } catch (error) {
       console.error('Error preparando MFA:', error);
-      setConnectionError(`No se pudo preparar el segundo factor: ${getSupabaseErrorMessage(error)}`);
+      setMfaVerified(false);
+      setSoaps([]);
+      setMfaError(`No se pudo preparar el segundo factor: ${getSupabaseErrorMessage(error)}`);
       resetMfaState();
     } finally {
       mfaPreparationRef.current = false;
@@ -318,7 +362,7 @@ function App() {
 
   // Conexión a Supabase + escucha de cambios en tiempo real.
   useEffect(() => {
-    if (!session || mfaRequired || isMfaChecking || !sb?.client) {
+    if (!session || !mfaVerified || mfaRequired || isMfaChecking || !sb?.client) {
       setIsLoading(false);
       return;
     }
@@ -352,7 +396,7 @@ function App() {
       isActive = false;
       sb.client.removeChannel(channel);
     };
-  }, [session, mfaRequired, isMfaChecking, sb]);
+  }, [session, mfaVerified, mfaRequired, isMfaChecking, sb]);
 
   // Cálculo de Métricas en vivo
   const metrics = useMemo(() => {
@@ -458,6 +502,8 @@ function App() {
     if (!sb?.client) return;
     await sb.client.auth.signOut();
     setSoaps([]);
+    setMfaVerified(false);
+    setMfaError('');
     resetMfaState();
     showNotification('Sesión cerrada.');
   };
@@ -467,25 +513,28 @@ function App() {
     if (!sb?.client || !mfaFactorId) return;
     setIsMfaVerifying(true);
     try {
-      const { data: challenge, error: challengeError } = await sb.client.auth.mfa.challenge({
-        factorId: mfaFactorId
-      });
-      if (challengeError) throw challengeError;
-
-      const { error } = await sb.client.auth.mfa.verify({
+      const { error } = await sb.client.auth.mfa.challengeAndVerify({
         factorId: mfaFactorId,
-        challengeId: challenge.id,
         code: mfaCode.trim()
       });
       if (error) throw error;
+
+      const { data: assurance, error: assuranceError } = await sb.client.auth.mfa.getAuthenticatorAssuranceLevel();
+      if (assuranceError) throw assuranceError;
+      if (assurance.currentLevel !== 'aal2') {
+        throw new Error('Supabase aun no confirmo la sesion como AAL2.');
+      }
+
       const { data: refreshed } = await sb.client.auth.getSession();
       setSession(refreshed.session);
+      setMfaVerified(true);
       resetMfaState();
+      setMfaError('');
       setConnectionError('');
       showNotification('Segundo factor verificado. Sesión blindada.');
     } catch (error) {
       console.error('Error verificando MFA:', error);
-      showNotification('Codigo MFA invalido o vencido. Intenta con el codigo actual.');
+      showNotification(`Error MFA: ${getSupabaseErrorMessage(error)}`);
     } finally {
       setIsMfaVerifying(false);
     }
@@ -704,13 +753,17 @@ function App() {
             <h1 className="text-xl font-bold tracking-tight">Ventas SOAP Buses</h1>
           </div>
           <div className="flex items-center gap-4">
-            {session ? (
+            {session && mfaVerified ? (
               <span className="flex items-center gap-2 text-xs font-medium text-blue-200">
                 <span className="relative flex h-3 w-3">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
                   <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
                 </span>
                 Supabase conectado
+              </span>
+            ) : session ? (
+              <span className="text-xs text-yellow-100 bg-yellow-700/60 px-3 py-1 rounded-full">
+                MFA pendiente
               </span>
             ) : connectionError ? (
               <span className="text-xs text-red-100 bg-red-700/60 px-3 py-1 rounded-full">
@@ -799,6 +852,44 @@ function App() {
                 {isMfaVerifying ? 'Verificando...' : 'Verificar y entrar'}
               </button>
             </form>
+          </div>
+        ) : session && !mfaVerified ? (
+          <div className="max-w-md mx-auto bg-white rounded-xl shadow-sm border border-slate-100 p-6">
+            <div className="mb-5">
+              <h2 className="text-2xl font-bold text-slate-900">Segundo factor pendiente</h2>
+              <p className="text-sm text-slate-500 mt-1">
+                La app no cargara datos hasta confirmar MFA.
+              </p>
+            </div>
+
+            {isMfaChecking ? (
+              <div className="rounded-lg bg-blue-50 border border-blue-100 px-4 py-3 text-sm font-medium text-blue-700 flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Preparando segundo factor...
+              </div>
+            ) : (
+              <>
+                <div className="mb-4 rounded-lg bg-red-50 border border-red-100 px-4 py-3 text-sm font-medium text-red-700">
+                  {mfaError || 'No se pudo preparar el segundo factor.'}
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={() => prepareMfa(session)}
+                    className="flex-1 px-5 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-bold"
+                  >
+                    Reintentar MFA
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="px-5 py-3 text-slate-600 hover:bg-slate-100 rounded-lg transition font-bold"
+                  >
+                    Salir
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         ) : !session && !isAuthLoading ? (
           <div className="max-w-md mx-auto bg-white rounded-xl shadow-sm border border-slate-100 p-6">
