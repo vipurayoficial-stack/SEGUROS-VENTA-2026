@@ -2049,7 +2049,6 @@
           precio_cobrado: Number(soap.precioCobrado) || total || null,
           efectivo,
           transferencia,
-          total_recibido: pagado,
           adeudado,
           estado_pago: estadoToSupabase(estado),
           vendedor: soap.vendedor || null,
@@ -2075,7 +2074,6 @@
         return {
           efectivo: metodoPago === 'efectivo' ? pagado : 0,
           transferencia: metodoPago === 'transferencia' ? pagado : 0,
-          total_recibido: pagado,
           adeudado,
           estado_pago: estadoToSupabase(estado),
           updated_at: new Date().toISOString()
