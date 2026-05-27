@@ -62,7 +62,6 @@ function App() {
   const [mfaRequired, setMfaRequired] = useState(false);
   const [mfaMode, setMfaMode] = useState('');
   const [mfaFactorId, setMfaFactorId] = useState('');
-  const [mfaChallengeId, setMfaChallengeId] = useState('');
   const [mfaCode, setMfaCode] = useState('');
   const [mfaQrCode, setMfaQrCode] = useState('');
   const [mfaSecret, setMfaSecret] = useState('');
@@ -220,18 +219,14 @@ function App() {
     setMfaRequired(false);
     setMfaMode('');
     setMfaFactorId('');
-    setMfaChallengeId('');
     setMfaCode('');
     setMfaQrCode('');
     setMfaSecret('');
   };
 
-  const startMfaChallenge = async (factorId, mode) => {
-    const { data, error } = await sb.client.auth.mfa.challenge({ factorId });
-    if (error) throw error;
-    setMfaFactorId(factorId);
-    setMfaChallengeId(data.id);
+  const requireMfaCode = (factorId, mode) => {
     setMfaCode('');
+    setMfaFactorId(factorId);
     setMfaMode(mode);
     setMfaRequired(true);
   };
@@ -254,17 +249,6 @@ function App() {
         return;
       }
 
-      if (assurance.nextLevel !== 'aal2') {
-        const { data: enrollment, error: enrollError } = await sb.client.auth.mfa.enroll({
-          factorType: 'totp'
-        });
-        if (enrollError) throw enrollError;
-        setMfaQrCode(enrollment.totp?.qr_code || '');
-        setMfaSecret(enrollment.totp?.secret || '');
-        await startMfaChallenge(enrollment.id, 'enroll');
-        return;
-      }
-
       const { data: factors, error: factorsError } = await sb.client.auth.mfa.listFactors();
       if (factorsError) throw factorsError;
 
@@ -272,8 +256,13 @@ function App() {
       if (verifiedTotp) {
         setMfaQrCode('');
         setMfaSecret('');
-        await startMfaChallenge(verifiedTotp.id, 'verify');
+        requireMfaCode(verifiedTotp.id, 'verify');
         return;
+      }
+
+      const unverifiedTotp = factors.totp?.find((factor) => factor.status === 'unverified');
+      if (unverifiedTotp) {
+        await sb.client.auth.mfa.unenroll({ factorId: unverifiedTotp.id });
       }
 
       const { data: enrollment, error: enrollError } = await sb.client.auth.mfa.enroll({
@@ -282,10 +271,10 @@ function App() {
       if (enrollError) throw enrollError;
       setMfaQrCode(enrollment.totp?.qr_code || '');
       setMfaSecret(enrollment.totp?.secret || '');
-      await startMfaChallenge(enrollment.id, 'enroll');
+      requireMfaCode(enrollment.id, 'enroll');
     } catch (error) {
       console.error('Error preparando MFA:', error);
-      setConnectionError('No se pudo preparar el segundo factor. Revisa la configuracion MFA en Supabase.');
+      setConnectionError(`No se pudo preparar el segundo factor: ${getSupabaseErrorMessage(error)}`);
       resetMfaState();
     } finally {
       mfaPreparationRef.current = false;
@@ -312,7 +301,7 @@ function App() {
         await prepareMfa(data.session);
         const { data: listener } = sb.client.auth.onAuthStateChange((_event, nextSession) => {
           setSession(nextSession);
-          prepareMfa(nextSession);
+          window.setTimeout(() => prepareMfa(nextSession), 0);
         });
         authSubscription = listener.subscription;
       } catch (error) {
@@ -475,12 +464,17 @@ function App() {
 
   const handleMfaVerify = async (e) => {
     e.preventDefault();
-    if (!sb?.client || !mfaFactorId || !mfaChallengeId) return;
+    if (!sb?.client || !mfaFactorId) return;
     setIsMfaVerifying(true);
     try {
+      const { data: challenge, error: challengeError } = await sb.client.auth.mfa.challenge({
+        factorId: mfaFactorId
+      });
+      if (challengeError) throw challengeError;
+
       const { error } = await sb.client.auth.mfa.verify({
         factorId: mfaFactorId,
-        challengeId: mfaChallengeId,
+        challengeId: challenge.id,
         code: mfaCode.trim()
       });
       if (error) throw error;
