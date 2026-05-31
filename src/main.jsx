@@ -73,10 +73,10 @@ function App() {
   const fileInputRef = useRef(null);
   const mfaPreparationRef = useRef(false);
   const [isProcessingPdf, setIsProcessingPdf] = useState(false);
-  const [pdfResultModal, setPdfResultModal] = useState({ show: false, newSoaps: [], existingToUpdate: [], duplicates: 0 });
+  const [pdfResultModal, setPdfResultModal] = useState({ show: false, newSoaps: [], existingToUpdate: [], duplicates: 0, skippedIncomplete: 0 });
 
   const [formData, setFormData] = useState({
-    patente: '', propietario: '', metodoPago: 'efectivo', pagado: '', adeudado: ''
+    patente: '', propietario: '', rut: '', metodoPago: 'efectivo', pagado: '', adeudado: ''
   });
 
   const normalizeEstado = (estadoPago, pagado, adeudado) => {
@@ -114,6 +114,33 @@ function App() {
       const v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
+  };
+
+  const cleanPdfText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+
+  const normalizeRut = (rut) => String(rut || '').trim().toUpperCase();
+
+  const parseMoney = (value) => {
+    const normalized = String(value || '').replace(/[^\d]/g, '');
+    return normalized ? Number(normalized) : 0;
+  };
+
+  const parseSoapFromPdfText = (rawText) => {
+    const text = cleanPdfText(rawText);
+    const patenteMatch =
+      text.match(/INSCRIPCION\s+R\.?\s*V\.?\s*M\.?\s*:?\s*([A-Z0-9-]+)/i) ||
+      text.match(/\bPATENTE\s*:?\s*([A-Z0-9-]+)/i);
+    const propietarioMatch = text.match(/PROPIETARIO\s*:?\s*(.+?)\s+R\.?\s*U\.?\s*T\.?\s*:?\s*[0-9]/i);
+    const rutMatch = text.match(/\bR\.?\s*U\.?\s*T\.?\s*:?\s*([0-9]{1,2}\.?[0-9]{3}\.?[0-9]{3}-[\dkK])/i);
+    const primaMatch = text.match(/(?:PRIMA|TOTAL|VALOR)[^\d$]*\$?\s*([0-9]{1,3}(?:\.[0-9]{3})+)/i);
+    const fallbackMoneyMatch = text.match(/\$\s*([0-9]{2,3}(?:\.[0-9]{3})+)/);
+
+    return {
+      patente: (patenteMatch?.[1] || '').trim().toUpperCase(),
+      propietario: (propietarioMatch?.[1] || '').trim().toUpperCase(),
+      rut: normalizeRut(rutMatch?.[1]),
+      adeudado: parseMoney(primaMatch?.[1] || fallbackMoneyMatch?.[1])
+    };
   };
 
   const mapDbRow = (row) => ({
@@ -163,7 +190,7 @@ function App() {
       poliza: soap.poliza || null,
       patente: (soap.patente || '').trim().toUpperCase(),
       propietario: (soap.propietario || '').trim().toUpperCase(),
-      rut: soap.rut || null,
+      rut: normalizeRut(soap.rut),
       tipo_vehiculo: soap.tipoVehiculo || null,
       marca: soap.marca || null,
       modelo: soap.modelo || null,
@@ -448,7 +475,7 @@ function App() {
   };
 
   const closePdfResultModal = () => {
-    setPdfResultModal({ show: false, newSoaps: [], existingToUpdate: [], duplicates: 0 });
+    setPdfResultModal({ show: false, newSoaps: [], existingToUpdate: [], duplicates: 0, skippedIncomplete: 0 });
   };
 
   const withTimeout = (promise, ms = 25000) => {
@@ -585,6 +612,7 @@ function App() {
       id: makeUuid(),
       patente: formData.patente.toUpperCase(),
       propietario: formData.propietario.toUpperCase(),
+      rut: normalizeRut(formData.rut),
       metodoPago: formData.metodoPago,
       pagado: Number(formData.pagado),
       adeudado: Number(formData.adeudado),
@@ -629,32 +657,22 @@ function App() {
       let newExtractedSoaps = [];
       let existingToUpdateList = [];
       let duplicateCount = 0;
+      let skippedIncompleteCount = 0;
 
       for (let i = 1; i <= numPages; i++) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
         
-        const text = textContent.items.map(item => item.str).join(' ').replace(/\s+/g, ' ');
+        const parsedSoap = parseSoapFromPdfText(textContent.items.map(item => item.str).join(' '));
 
-        const patenteMatch = text.match(/INSCRIPCION R\.V\.M\.:\s*([A-Z0-9-]+)/i);
-        const propietarioMatch = text.match(/PROPIETARIO:\s*(.+?)\s*RUT:/i);
-        
-        // Extracción inteligente de la Prima (Precio)
-        let adeudadoInicial = 0;
-        const primaMatch = text.match(/(?:PRIMA|TOTAL|VALOR)[^\d$]*\$?\s*([0-9]{1,3}(?:\.[0-9]{3})+)/i);
-        if (primaMatch) {
-          adeudadoInicial = parseInt(primaMatch[1].replace(/\./g, ''), 10);
-        } else {
-          // Fallback: buscar cualquier monto grande con signo $
-          const moneyMatch = text.match(/\$\s*([0-9]{2,3}(?:\.[0-9]{3})+)/);
-          if (moneyMatch) {
-            adeudadoInicial = parseInt(moneyMatch[1].replace(/\./g, ''), 10);
+        if (parsedSoap.patente && parsedSoap.propietario) {
+          if (!parsedSoap.rut) {
+            skippedIncompleteCount++;
+            continue;
           }
-        }
 
-        if (patenteMatch && propietarioMatch) {
-          const patenteEncontrada = patenteMatch[1].trim().toUpperCase();
-          const propietarioEncontrado = propietarioMatch[1].trim().toUpperCase();
+          const patenteEncontrada = parsedSoap.patente;
+          const adeudadoInicial = parsedSoap.adeudado;
 
           const existe = soaps.find(s => s.patente === patenteEncontrada);
           
@@ -671,7 +689,8 @@ function App() {
             if (!newExtractedSoaps.some(s => s.patente === patenteEncontrada)) {
               newExtractedSoaps.push({
                 patente: patenteEncontrada,
-                propietario: propietarioEncontrado,
+                propietario: parsedSoap.propietario,
+                rut: parsedSoap.rut,
                 adeudado: adeudadoInicial
               });
             }
@@ -679,7 +698,13 @@ function App() {
         }
       }
 
-      setPdfResultModal({ show: true, newSoaps: newExtractedSoaps, existingToUpdate: existingToUpdateList, duplicates: duplicateCount });
+      setPdfResultModal({
+        show: true,
+        newSoaps: newExtractedSoaps,
+        existingToUpdate: existingToUpdateList,
+        duplicates: duplicateCount,
+        skippedIncomplete: skippedIncompleteCount
+      });
 
     } catch (error) {
       console.error("Error al procesar el PDF:", error);
@@ -700,6 +725,7 @@ function App() {
           id: makeUuid(),
           patente: soap.patente,
           propietario: soap.propietario,
+          rut: soap.rut,
           metodoPago: '',
           pagado: 0,
           adeudado: soap.adeudado || 0,
@@ -1013,7 +1039,7 @@ function App() {
             </select>
 
             <button 
-              onClick={() => { setFormData({ patente: '', propietario: '', metodoPago: 'efectivo', pagado: '', adeudado: '' }); setIsAdding(true); }}
+                onClick={() => { setFormData({ patente: '', propietario: '', rut: '', metodoPago: 'efectivo', pagado: '', adeudado: '' }); setIsAdding(true); }}
               className="flex items-center justify-center gap-2 bg-blue-600 text-white px-5 py-3 rounded-lg hover:bg-blue-700 transition font-medium flex-1 md:flex-none"
             >
               <Plus className="w-5 h-5" /> <span className="hidden md:inline">Nuevo</span>
@@ -1136,6 +1162,10 @@ function App() {
                     <label className="block text-sm font-bold text-slate-700 mb-1">Nombre del Propietario</label>
                     <input type="text" required placeholder="Nombre Completo o Empresa" className="w-full px-4 py-3 border border-slate-300 rounded-lg uppercase" value={formData.propietario} onChange={e => setFormData({...formData, propietario: e.target.value})} />
                   </div>
+                  <div>
+                    <label className="block text-sm font-bold text-slate-700 mb-1">RUT</label>
+                    <input type="text" required placeholder="Ej: 12.345.678-9" className="w-full px-4 py-3 border border-slate-300 rounded-lg uppercase font-mono" value={formData.rut} onChange={e => setFormData({...formData, rut: e.target.value})} />
+                  </div>
                 </div>
               ) : (
                 <div className="bg-blue-50 p-4 rounded-xl border border-blue-100 mb-4">
@@ -1232,6 +1262,12 @@ function App() {
               {pdfResultModal.duplicates > 0 && (
                 <div className="bg-slate-100 text-slate-500 text-sm py-2 px-4 rounded-lg inline-block">
                   Ignoramos {pdfResultModal.duplicates} buses porque ya están perfectos en tu lista.
+                </div>
+              )}
+
+              {pdfResultModal.skippedIncomplete > 0 && (
+                <div className="bg-yellow-50 text-yellow-800 text-sm py-3 px-4 rounded-lg font-medium">
+                  {pdfResultModal.skippedIncomplete} documento(s) no se importaron porque el PDF no dejó leer patente, propietario o RUT con seguridad.
                 </div>
               )}
               
